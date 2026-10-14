@@ -1,0 +1,7 @@
+# Versioni vecchie della pagina, tenute solo sul PC
+Backup/
+# Firebase: cartella pubblicata (la rigenera copia-in-public.js) e cache della CLI
+public/
+.firebase/
+firebase-debug.log
+node_modules/
