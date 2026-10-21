@@ -1,0 +1,9 @@
+{
+  "name": "allenamento",
+  "private": true,
+  "description": "App di allenamento a file unico (allenamento_pro.html) su Firebase Hosting e Firestore.",
+  "scripts": {
+    "test": "node --test \"test/*.test.js\"",
+    "prova": "node test/server-prova.js 8020"
+  }
+}

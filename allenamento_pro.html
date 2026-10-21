@@ -4564,18 +4564,21 @@
         }
 
         // Fine allenamento: le note scritte diventano note dell'esercizio. Ritorna quante.
-        function salvaNoteSessione(sessione, data) {
+        // "diario" (solo dall'IA) raccoglie le note scritte, per poterle annullare.
+        function salvaNoteSessione(sessione, data, diario) {
             const conNota = sessione.esercizi.filter(es => String(es.nota || '').trim());
             if (!conNota.length) return 0;
             const mappa = caricaNote();
             conNota.forEach((es, i) => {
-                (mappa[es.key] = mappa[es.key] || []).push({
+                const nota = {
                     id: 'n' + Number(sessione.inizio).toString(36) + i.toString(36) + Math.random().toString(36).slice(2, 6),
                     data,
                     inizio: sessione.inizio,
                     giorno: sessione.giorno,
                     testo: String(es.nota).trim()
-                });
+                };
+                (mappa[es.key] = mappa[es.key] || []).push(nota);
+                if (diario) diario.push({ t: 'nota+', id: nota.id });
             });
             salvaNote(mappa);
             conNota.forEach(es => aggiornaNoteGemelle(es.key));
@@ -4651,14 +4654,12 @@
             return true;
         }
 
-        function avviaSessione(nomeGiorno) {
-            if (sessioneAttiva && !confirm(`C'è già un allenamento in corso (${sessioneAttiva.giorno}). Scartarlo e iniziare "${nomeGiorno}"?`)) return;
-
+        // Allenamento nuovo di una routine, con le serie da cui partire (null se è vuota)
+        function nuovaSessioneDi(nomeGiorno) {
             const chiavi = eserciziDelGiorno(nomeGiorno);
-            if (!chiavi.length) { alert('Questo giorno non ha esercizi.'); return; }
-
+            if (!chiavi.length) return null;
             const ora = Date.now();
-            sessioneAttiva = {
+            return {
                 giorno: nomeGiorno,
                 inizio: ora,
                 ultimaAttivita: ora,
@@ -4669,9 +4670,31 @@
                     serie: serieIniziali(key)
                 }))
             };
+        }
+
+        function avviaSessione(nomeGiorno) {
+            if (sessioneAttiva && !confirm(`C'è già un allenamento in corso (${sessioneAttiva.giorno}). Scartarlo e iniziare "${nomeGiorno}"?`)) return;
+
+            const nuova = nuovaSessioneDi(nomeGiorno);
+            if (!nuova) { alert('Questo giorno non ha esercizi.'); return; }
+
+            sessioneAttiva = nuova;
             salvaSessioneAttiva();
             apriSessione();
             mostraToast('Allenamento avviato');
+        }
+
+        // Allenamento in corso cambiato da fuori (l'IA o il suo "Annulla"): la schermata,
+        // il pulsante "Riprendi" e il conteggio della durata si rimettono in pari
+        function aggiornaVistaSessione() {
+            if (!sessioneAttiva) { chiudiSessioneUI(); return; }
+            if (!intervalloDurata) intervalloDurata = setInterval(aggiornaStatSessione, 1000);
+            if (document.getElementById('sessione-overlay').classList.contains('visible')) {
+                document.getElementById('sessione-titolo').textContent = sessioneAttiva.giorno;
+                renderSessione();
+            }
+            aggiornaStatSessione();
+            aggiornaBannerSessione();
         }
 
         function apriSessione() {
@@ -5158,17 +5181,26 @@
                 return;
             }
 
+            const esito = salvaSessioneInCorso();
+            if (!esito.registrato) mostraToast(esito.note === 1 ? 'Nota salvata' : `${esito.note} note salvate`);
+            else mostraToast(esito.note ? `Allenamento salvato con ${esito.note === 1 ? '1 nota' : esito.note + ' note'}` : 'Allenamento salvato');
+        }
+
+        // Salva e chiude l'allenamento in corso: serie nello storico, voce tra gli
+        // allenamenti salvati, schema aggiornato a quanto fatto e note degli esercizi.
+        // Senza serie fatte si tengono solo le note. È lo stesso "Salva" del riepilogo,
+        // usato anche dall'IA, che passa il suo "diario" per poterlo annullare.
+        function salvaSessioneInCorso(diario) {
             const data = new Date(sessioneAttiva.inizio).toISOString().split('T')[0];
             const { volume, serie, reps } = statisticheSessione();
 
             // Nessuna serie fatta: si tengono solo le note, l'allenamento non entra nello storico
             if (serie === 0) {
-                const note = salvaNoteSessione(sessioneAttiva, data);
+                const note = salvaNoteSessione(sessioneAttiva, data, diario);
                 sessioneAttiva = null;
                 salvaSessioneAttiva();
                 chiudiSessioneUI();
-                mostraToast(note === 1 ? 'Nota salvata' : `${note} note salvate`);
-                return;
+                return { registrato: false, note, data };
             }
 
             let eserciziSalvati = 0;
@@ -5178,14 +5210,19 @@
                 const fatte = es.serie.filter(s => s.fatto && s.reps !== '' && s.reps != null);
                 if (!fatte.length) return;
                 eserciziSalvati++;
-                fatte.forEach(s => registraSet(es.key, data, Number(s.reps), s.peso === '' ? 0 : Number(s.peso), s.tipo));
+                fatte.forEach(s => {
+                    const set = { reps: Number(s.reps), peso: s.peso === '' ? 0 : Number(s.peso), tipo: s.tipo };
+                    registraSet(es.key, data, set.reps, set.peso, set.tipo);
+                    if (diario) diario.push({ t: 'set+', chiave: es.key, data, set });
+                });
                 // Se nel frattempo l'esercizio è stato rinominato o tolto dalla scheda, niente schema orfano
                 if (esistenti[es.key] && aggiornaSchemaDaSessione(es)) aggiornaSchemaEditor(es.key);
             });
 
             const sessioni = caricaSessioni();
+            const id = 's' + sessioneAttiva.inizio;
             sessioni.push({
-                id: 's' + sessioneAttiva.inizio,
+                id,
                 giorno: sessioneAttiva.giorno,
                 data,
                 inizio: sessioneAttiva.inizio,
@@ -5193,7 +5230,8 @@
                 volume, serie, reps, esercizi: eserciziSalvati
             });
             salvaSessioni(sessioni);
-            const note = salvaNoteSessione(sessioneAttiva, data);
+            if (diario) diario.push({ t: 'allenamento+', id });
+            const note = salvaNoteSessione(sessioneAttiva, data, diario);
 
             sessioneAttiva = null;
             salvaSessioneAttiva();
@@ -5203,7 +5241,7 @@
             popolaSelectRoutine();
             aggiornaGraficoRoutine();
             syncDayActions(); // "Ultima: …" della routine
-            mostraToast(note ? `Allenamento salvato con ${note === 1 ? '1 nota' : note + ' note'}` : 'Allenamento salvato');
+            return { registrato: true, note, data, volume, serie, esercizi: eserciziSalvati };
         }
 
         // --- Pulsanti "Avvia" sui giorni della scheda ---
@@ -5579,34 +5617,44 @@
         }
 
         // ================= AZIONI IA =================
+        // Regola dell'app: tutto ciò che vedi o cambi a mano, l'IA lo legge e lo cambia.
         // L'IA propone un ELENCO DI AZIONI che ricalcano una per una le cose che puoi fare
-        // a mano: scheda (giorni, esercizi, correzioni, evidenziazioni, schema serie,
-        // riposo, note tecniche), storico carichi, allenamenti salvati, foto e modello IA.
-        // Restano fuori solo le cose che non sono dati: chiave API (che l'IA non vede mai),
-        // accesso al cloud, backup su file, preferenze di visualizzazione e i comandi
-        // dell'allenamento dal vivo (al loro posto c'è "registra_allenamento").
+        // a mano: scheda (giorni, esercizi, correzioni, evidenziazioni gialle e blu,
+        // spaziatura, schema serie, riposo, note tecniche), note degli allenamenti, storico
+        // carichi, allenamenti salvati, foto, modello IA e ricerca web.
+        // Comanda anche l'allenamento in corso (serie, note, avvio, salvataggio) e l'archivio
+        // dei messaggi del coach. Restano fuori solo le cose che non sono dati: chiave API
+        // (che l'IA non vede mai), accesso al cloud, backup su file, timer di riposo,
+        // preferenze di visualizzazione e impostazioni della chat "Chiedi al coach".
+        // L'elenco completo, con il motivo di ogni esclusione, è in test/parita-ia.test.js:
+        // il test fallisce se compare un comando o un dato nuovo senza la sua azione.
         //
         // Modello ibrido: ciò che aggiunge o aggiorna viene applicato subito (e ti viene
         // raccontato punto per punto); ciò che rinomina, sposta o elimina passa prima da
         // una conferma esplicita.
 
         const AZIONI_VALIDE = [
-            'correzioni', 'correzioni_personali', 'evidenzia', 'schema_serie', 'riposo', 'nota',
+            'correzioni', 'correzioni_personali', 'evidenzia', 'spaziatura', 'schema_serie', 'riposo', 'nota',
             'crea_giorno', 'crea_esercizio',
             'rinomina_giorno', 'rinomina_esercizio',
             'sposta_giorno', 'sposta_esercizio',
             'elimina_giorno', 'elimina_esercizio',
             'registra_carichi', 'registra_allenamento',
-            'elimina_carichi', 'elimina_allenamento', 'elimina_foto',
-            'imposta_modello', 'rimuovi_modello'
+            'aggiungi_nota_allenamento', 'modifica_nota_allenamento',
+            'avvia_allenamento', 'serie_in_corso', 'nota_in_corso', 'termina_allenamento',
+            'aggiungi_messaggi_coach',
+            'elimina_carichi', 'elimina_allenamento', 'elimina_foto', 'elimina_nota_allenamento', 'elimina_messaggio_coach',
+            'imposta_modello', 'rimuovi_modello', 'imposta_ricerca_web'
         ];
 
-        // Toccano nomi, posizione o esistenza di qualcosa: chiedono conferma
+        // Toccano nomi, posizione o esistenza di qualcosa: chiedono conferma. Avviare un
+        // allenamento no: non tocca niente di salvato e l'IA non lo fa se ce n'è già uno.
         const AZIONI_DA_CONFERMARE = new Set([
             'rinomina_giorno', 'rinomina_esercizio',
             'sposta_giorno', 'sposta_esercizio',
             'elimina_giorno', 'elimina_esercizio',
-            'elimina_carichi', 'elimina_allenamento', 'elimina_foto'
+            'elimina_carichi', 'elimina_allenamento', 'elimina_foto', 'elimina_nota_allenamento', 'elimina_messaggio_coach',
+            'termina_allenamento'
         ]);
 
         // Si applicano in quest'ordine: prima si crea, poi si riempie, e solo alla fine
@@ -5615,13 +5663,18 @@
         // anche nuove serie, vince l'ordine esplicito e non quanto fatto.
         const ORDINE_AZIONI = [
             'crea_giorno', 'crea_esercizio',
+            'avvia_allenamento',
             'registra_carichi', 'registra_allenamento',
-            'correzioni', 'correzioni_personali', 'evidenzia', 'schema_serie', 'riposo', 'nota',
-            'imposta_modello', 'rimuovi_modello',
+            'aggiungi_nota_allenamento', 'modifica_nota_allenamento',
+            'serie_in_corso', 'nota_in_corso',
+            'aggiungi_messaggi_coach',
+            'correzioni', 'correzioni_personali', 'evidenzia', 'spaziatura', 'schema_serie', 'riposo', 'nota',
+            'imposta_modello', 'rimuovi_modello', 'imposta_ricerca_web',
             'sposta_esercizio', 'sposta_giorno',
             'rinomina_esercizio', 'rinomina_giorno',
-            'elimina_carichi', 'elimina_allenamento', 'elimina_foto',
-            'elimina_esercizio', 'elimina_giorno'
+            'elimina_carichi', 'elimina_allenamento', 'elimina_foto', 'elimina_nota_allenamento', 'elimina_messaggio_coach',
+            'elimina_esercizio', 'elimina_giorno',
+            'termina_allenamento'
         ];
 
         const escapeHtml = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -5636,19 +5689,45 @@
             return `${iso} (${d.toLocaleDateString('it-IT', { weekday: 'long' })})`;
         }
 
+        // Campi di un dato che l'IA riceve così come sono salvati. Si toglie solo ciò che
+        // è già detto in altro modo: così un campo aggiunto domani arriva all'IA da solo.
+        const senzaCampi = (obj, ...via) => {
+            const copia = { ...obj };
+            via.forEach(k => delete copia[k]);
+            return copia;
+        };
+
+        // Una serie scritta corta per l'IA: "W 60x10", "95x7". Gli eventuali campi in più
+        // (oggi non ce ne sono) finiscono tra parentesi quadre, così non si perdono.
+        function serieIA(s) {
+            const extra = Object.entries(s || {}).filter(([k, v]) => !['tipo', 'peso', 'reps'].includes(k) && v !== '' && v != null);
+            return `${s.tipo === 'W' ? 'W ' : ''}${s.peso > 0 ? s.peso : 'BW'}x${s.reps}${extra.length ? ` [${extra.map(([k, v]) => `${k}=${v}`).join(', ')}]` : ''}`;
+        }
+
         // Tutto lo storico di un esercizio, una sessione per riga: "2026-09-01: W 60x10, 95x7"
         function storicoIA(entries) {
             if (!entries || !entries.length) return undefined;
             const rec = recordStorico(entries);
             return {
-                sessioni: entries.map(e => `${e.data}: ${(e.sets || []).map(s => `${s.tipo === 'W' ? 'W ' : ''}${s.peso > 0 ? s.peso : 'BW'}x${s.reps}`).join(', ')}`),
+                sessioni: entries.map(e => `${e.data}: ${(e.sets || []).map(serieIA).join(', ')}`),
                 record_1rm_stimato: rec ? Math.round(stimaRM(rec.set.peso, rec.set.reps) * 10) / 10 : null
             };
+        }
+
+        // Punti segnati in blu (le novità: li mette l'IA, ma li metti e togli anche tu).
+        // Nell'HTML delle correzioni la classe non arriva, perché l'IA la usa per marcare
+        // le novità della SUA risposta: qui si dice quali punti sono blu adesso.
+        function puntiBluIA(esNode) {
+            const lis = Array.from(esNode.querySelectorAll('li.ai-nuovo'))
+                .concat(Array.from((esNode.querySelector(':scope > .inline-tracker .teoria-body') || document.createElement('div')).querySelectorAll('li.ai-nuovo')));
+            const testi = Array.from(new Set(lis.map(testoPunto).filter(Boolean)));
+            return testi.length ? testi : undefined;
         }
 
         function costruisciContestoIA() {
             const mappa = ottieniMappaEsercizi();
             const logs = caricaLogs();
+            const schemi = caricaSchemi();
             const perGiorno = new Map();
 
             for (const [chiave, ul] of Object.entries(mappa)) {
@@ -5658,9 +5737,10 @@
                 const nomeGiorno = daySummary ? testoPulito(daySummary) : 'Giorno Sconosciuto';
                 if (!perGiorno.has(nomeGiorno)) perGiorno.set(nomeGiorno, []);
 
-                const schema = schemaDi(chiave);
+                const schema = { ...(schemi[chiave] || {}), ...schemaDi(chiave) };
                 const gemelli = gemelliDi(esNode).map(g => testoPulito(g.parentElement.querySelector(':scope > summary.day-summary'))).filter(Boolean);
-                const foto = fotoDelMovimento(chiave).map(f => ({ id: f.id, data: String(f.ts || '').slice(0, 10) }));
+                const foto = fotoDelMovimento(chiave).map(f => ({ ...senzaCampi(f, 'src', 'ts'), data: String(f.ts || '').slice(0, 10) }));
+                const note = noteDelMovimento(chiave).map(n => senzaCampi(n, 'chiave', 'inizio'));
                 perGiorno.get(nomeGiorno).push({
                     chiave,
                     nome: testoPulito(esNode.querySelector(':scope > summary')),
@@ -5668,25 +5748,72 @@
                     stesso_movimento_anche_in: gemelli.length ? gemelli : undefined,
                     correzioni_attuali: correzioniCorrenti(ul) || '(nessuna correzione presente)',
                     correzioni_personali: correzioniMieCorrenti(esNode),
+                    punti_in_blu: puntiBluIA(esNode),
+                    note_allenamenti: note.length ? note : undefined,
                     programmazione: {
-                        serie: schema.serie.map(s => ({ tipo: s.tipo, peso: s.peso, reps: s.reps })),
-                        riposo_sec: schema.riposo,
-                        nota: schema.nota
+                        ...senzaCampi(schema, 'serie', 'riposo'),
+                        serie: schema.serie.map(s => ({ ...s })),
+                        riposo_sec: schema.riposo
                     },
                     storico_carichi: storicoIA(logs[chiave]),
                     foto: foto.length ? foto : undefined
                 });
             }
 
+            const spaziatura = spaziaturaScheda();
             return {
                 oggi: oggiPerIA(),
                 giorni: Array.from(perGiorno, ([giorno, esercizi], i) => ({ posizione: i + 1, giorno, esercizi })),
+                allenamento_in_corso: allenamentoInCorsoIA(),
                 allenamenti_salvati: caricaSessioni().slice().sort((a, b) => a.inizio - b.inizio).map(s => ({
-                    id: s.id, data: s.data, giorno: s.giorno,
+                    ...senzaCampi(s, 'inizio', 'durata', 'volume'),
                     durata_min: Math.round((s.durata || 0) / 60),
-                    volume_kg: s.volume, serie: s.serie, reps: s.reps, esercizi: s.esercizi
+                    volume_kg: s.volume
                 })),
-                modello_ia: { attuale: modelloCorrente, disponibili: modelliDisponibili }
+                archivio_coach: archivioCoachIA(),
+                spaziatura_scheda: { interlinea: spaziatura.interlinea, spazio_tra_punti_pt: spaziatura.traPunti },
+                modello_ia: { attuale: modelloCorrente, disponibili: modelliDisponibili, ricerca_web: ricercaWebAttiva() }
+            };
+        }
+
+        // L'allenamento avviato con "Avvia la routine" e non ancora salvato, come lo vedi
+        // nella sua schermata: serie (con "fatto" se l'hai spuntata) e nota di ogni esercizio
+        function allenamentoInCorsoIA() {
+            const s = sessioneAttiva;
+            if (!s) return undefined;
+            return {
+                ...senzaCampi(s, 'inizio', 'ultimaAttivita', 'pausaTotale', 'sospesaDa', 'esercizi'),
+                iniziato: new Date(s.inizio).toLocaleString('it-IT', { weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' }),
+                durata_min: Math.round(durataSessione() / 60),
+                in_pausa: !!sospensioneSessione(),
+                esercizi: s.esercizi.map(es => ({
+                    chiave: es.key,
+                    ...senzaCampi(es, 'key', 'serie'),
+                    serie: es.serie.map(x => senzaCampi(x, 'piano'))
+                }))
+            };
+        }
+
+        // Archivio dei messaggi del coach (vista Coach): per intero solo quelli degli
+        // ultimi giorni, perché l'archivio intero renderebbe lenta ogni richiesta. Quelli
+        // più vecchi li legge per intero la chat "Chiedi al coach". Scelta dell'utente.
+        const GIORNI_ARCHIVIO_IA = 60;
+        const MAX_MESSAGGI_ARCHIVIO_IA = 300;
+
+        function archivioCoachIA() {
+            const msgs = caricaArchivioCoach().messaggi;
+            if (!msgs.length) return { messaggi_totali: 0 };
+            const atleta = impostazioniCoach().atleta;
+            const dal = spostaGiorni(oggiISO(), -GIORNI_ARCHIVIO_IA);
+            const recenti = msgs.filter(m => m.data >= dal);
+            const fuori = Math.max(0, recenti.length - MAX_MESSAGGI_ARCHIVIO_IA);
+            return {
+                messaggi_totali: msgs.length,
+                periodo: { dal: msgs[0].data, al: msgs[msgs.length - 1].data },
+                tuo_nome: atleta || undefined,
+                recenti_dal: dal,
+                messaggi_recenti: recenti.slice(fuori).map(m => ({ ...senzaCampi(m, 'agg'), ruolo: ruoloAutore(m.autore, atleta) })),
+                nota: fuori ? `${fuori} messaggi del periodo, i più vecchi, non sono inclusi: sono troppi` : undefined
             };
         }
 
@@ -6188,7 +6315,36 @@
                 case 'sposta_esercizio': return `Sposta «${es}»${az.giorno_destinazione ? ` nel giorno «${az.giorno_destinazione}»` : ''}${az.posizione ? ` (posizione ${az.posizione})` : ''}`;
                 case 'elimina_giorno': return `ELIMINA il giorno «${gi}» e tutti i suoi esercizi`;
                 case 'elimina_esercizio': return `ELIMINA l'esercizio «${es}»`;
-                case 'evidenzia': return `${az.attiva === false ? 'Togli evidenziazione' : 'Evidenzia'} in «${es}»: "${az.punto || ''}"`;
+                case 'evidenzia': {
+                    const blu = az.colore === 'blu';
+                    return `${az.attiva === false ? (blu ? 'Togli il blu' : 'Togli evidenziazione') : (blu ? 'Segna in blu' : 'Evidenzia')} in «${es}»: "${az.punto || ''}"`;
+                }
+                case 'spaziatura': return az.esercizio
+                    ? `Spaziatura in «${es}»: "${az.punto || ''}"${az.ripristina ? ' → come il resto della scheda' : ''}`
+                    : `Spaziatura di tutta la scheda${az.ripristina ? ' → valori iniziali' : ''}`;
+                case 'aggiungi_nota_allenamento': return `Nota dell'allenamento su «${es}», ${az.data || '?'}: "${az.testo || ''}"`;
+                case 'modifica_nota_allenamento': return `Modifica la nota dell'allenamento su «${es}» → "${az.testo || ''}"`;
+                case 'elimina_nota_allenamento': {
+                    const n = cercaNota(caricaNote(), (risolviEsercizio(az.esercizio, {}) || {}).chiave || es, az.nota_id);
+                    return `ELIMINA la nota dell'allenamento su «${es}»${n ? ` del ${n.nota.data}: "${n.nota.testo.slice(0, 80)}${n.nota.testo.length > 80 ? '…' : ''}"` : ''}`;
+                }
+                case 'imposta_ricerca_web': return `Ricerca web dell'assistente → ${az.attiva === false ? 'spenta' : 'accesa'}`;
+                case 'avvia_allenamento': return `Avvia l'allenamento «${gi}»`;
+                case 'serie_in_corso': return `Allenamento in corso, «${es}» → ${descriviSerie(normalizzaSerie(az.serie))}`;
+                case 'nota_in_corso': return `Allenamento in corso, nota su «${es}» → ${az.testo ? `"${az.testo}"` : '(tolta)'}`;
+                case 'termina_allenamento': {
+                    const quale = sessioneAttiva ? ` «${sessioneAttiva.giorno}»` : '';
+                    return az.salva === false ? `SCARTA l'allenamento in corso${quale}: serie e note non vengono salvate` : `Salva e chiudi l'allenamento in corso${quale}`;
+                }
+                case 'aggiungi_messaggi_coach': {
+                    const n = Array.isArray(az.messaggi_coach) ? az.messaggi_coach.length : 0;
+                    return `Aggiungi all'archivio del coach ${n === 1 ? '1 messaggio' : n + ' messaggi'}`;
+                }
+                case 'elimina_messaggio_coach': {
+                    const m = caricaArchivioCoach().messaggi.find(x => x.id === az.messaggio_id);
+                    const testo = m ? (m.testo || descriviAllegati(m.allegati)) : '';
+                    return `ELIMINA dall'archivio del coach ${m ? `il messaggio di ${m.autore} del ${dataIt(m.data)}: "${testo.slice(0, 100)}${testo.length > 100 ? '…' : ''}"` : `il messaggio «${az.messaggio_id}»`}`;
+                }
                 case 'registra_carichi': return `Storico di «${es}», ${az.data || '?'} → ${descriviSerie(setDaIA(az.serie))}`;
                 case 'registra_allenamento': return `Registra allenamento «${gi}» del ${az.data || '?'}`;
                 case 'elimina_carichi': return `ELIMINA dallo storico di «${es}» la sessione del ${az.data || '?'}`;
@@ -6230,6 +6386,8 @@
         function annotaRinomine(esito, ctx) {
             esito.rinomine.forEach(([da, a]) => { ctx.alias[da] = a; });
             if (esito.rinomine.length) ctx.diario.push({ t: 'chiavi', rinomine: esito.rinomine });
+            // Come per le rinomine a mano: anche l'allenamento in corso segue le chiavi nuove
+            rinominaChiaviSessioneAttiva(esito.rinomine);
         }
 
         function trovaFotoIA(id) {
@@ -6246,11 +6404,19 @@
                     v.rinomine.slice().reverse().forEach(([da, a]) => {
                         [logs, foto, note].forEach(m => { if (m[a]) { m[da] = m[a]; delete m[a]; } });
                     });
+                    rinominaChiaviSessioneAttiva(v.rinomine.slice().reverse().map(([da, a]) => [a, da]));
                     break;
                 case 'giorni':
                     v.coppie.slice().reverse().forEach(([da, a]) => {
                         sessioni.forEach(s => { if (s.giorno === a) s.giorno = da; });
                         Object.values(note).forEach(lista => (lista || []).forEach(n => { if (n.giorno === a) n.giorno = da; }));
+                        // Anche l'allenamento in corso torna al nome di prima, come le sue chiavi
+                        if (sessioneAttiva && sessioneAttiva.giorno === a) {
+                            sessioneAttiva.giorno = da;
+                            salvaSessioneAttiva();
+                            document.getElementById('sessione-titolo').textContent = da;
+                            aggiornaBannerSessione();
+                        }
                     });
                     break;
                 case 'set+': {
@@ -6286,23 +6452,120 @@
                     if (!lista.some(f => f.id === v.foto.id)) lista.push(v.foto);
                     break;
                 }
+                // Note degli allenamenti: si cercano per id (possono stare sotto un'altra chiave
+                // dello stesso movimento, o essere passate a un'altra chiave con una rinomina)
+                case 'nota+':
+                    Object.keys(note).forEach(k => { note[k] = (note[k] || []).filter(n => n.id !== v.id); });
+                    break;
+                case 'nota~':
+                    // Solo se la nota dice ancora ciò che ha scritto l'IA: una tua modifica successiva resta
+                    Object.values(note).forEach(lista => (lista || []).forEach(n => { if (n.id === v.id && n.testo === v.nuovo) n.testo = v.testo; }));
+                    break;
+                case 'nota-': {
+                    if (Object.values(note).some(lista => (lista || []).some(n => n.id === v.nota.id))) break;
+                    (note[v.chiave] = note[v.chiave] || []).push(v.nota);
+                    break;
+                }
                 case 'modello':
                     modelliDisponibili = v.elenco.slice();
                     modelloCorrente = v.modello;
                     renderModelli();
                     salvaModelli();
                     break;
+                case 'ricerca':
+                    localStorage.setItem(RICERCA_WEB_KEY, v.attiva ? 'true' : 'false');
+                    caricaModelli(); // riallinea la casella in "Configurazione"
+                    break;
+                case 'spaziatura':
+                    // Sempre con setItem: è quello che il cloud ascolta (removeItem non arriverebbe)
+                    localStorage.setItem(SPAZIATURA_KEY, v.valore == null ? JSON.stringify(SPAZIATURA_INIZIALE) : v.valore);
+                    applicaSpaziaturaScheda();
+                    break;
+                // Allenamento in corso: torna com'era solo se è ancora esattamente come l'ha
+                // lasciato l'IA ("dopo"). Se nel frattempo hai segnato altre serie, l'hai salvato,
+                // scartato o ne hai avviato un altro, non si tocca: niente del tuo va perso.
+                // Il salvataggio fatto dall'IA (serie nello storico, allenamento salvato, note)
+                // si toglie solo insieme al ritorno dell'allenamento in corso.
+                case 'sessione':
+                    if (firmaSessione(sessioneAttiva) !== v.dopo) {
+                        return v.dopo === null
+                            ? "l'allenamento chiuso dall'IA resta chiuso, perché nel frattempo ne hai avviato un altro"
+                            : "l'allenamento in corso è cambiato dopo la modifica dell'IA, quindi resta com'è";
+                    }
+                    (v.salvataggio || []).slice().reverse().forEach(x => annullaVoceDiario(x, logs, sessioni, foto, note));
+                    sessioneAttiva = v.prima ? JSON.parse(JSON.stringify(v.prima)) : null;
+                    salvaSessioneAttiva();
+                    aggiornaVistaSessione();
+                    break;
+                // Archivio del coach: si tolgono i messaggi aggiunti dall'IA, si rimettono quelli eliminati
+                case 'coach+': {
+                    const archivio = caricaArchivioCoach();
+                    archivio.messaggi = archivio.messaggi.filter(m => m.agg !== v.idImport);
+                    archivio.importazioni = archivio.importazioni.filter(x => x.id !== v.idImport);
+                    salvaArchivioCoach(archivio);
+                    break;
+                }
+                case 'coach-': {
+                    const archivio = caricaArchivioCoach();
+                    if (archivio.messaggi.some(m => m.id === v.messaggio.id)) break;
+                    archivio.messaggi.push(v.messaggio);
+                    salvaArchivioCoach(archivio);
+                    break;
+                }
             }
         }
 
+        // Ritorna l'elenco delle cose lasciate com'erano perché nel frattempo le hai cambiate tu
         function annullaDiario(diario) {
-            if (!diario.length) return;
+            if (!diario.length) return [];
             const logs = caricaLogs(), sessioni = caricaSessioni(), foto = caricaFoto(), note = caricaNote();
-            diario.slice().reverse().forEach(v => annullaVoceDiario(v, logs, sessioni, foto, note));
+            const lasciate = diario.slice().reverse().map(v => annullaVoceDiario(v, logs, sessioni, foto, note)).filter(Boolean);
             salvaLogs(logs);
             salvaSessioni(sessioni);
-            if (diario.some(v => v.t === 'chiavi' || v.t === 'foto-')) salvaFoto(foto);
-            if (diario.some(v => v.t === 'chiavi' || v.t === 'giorni')) salvaNote(note);
+            // Le voci del salvataggio dell'allenamento stanno dentro quella della sessione
+            const tutte = diario.flatMap(v => [v, ...(v.salvataggio || [])]);
+            if (tutte.some(v => v.t === 'chiavi' || v.t === 'foto-')) salvaFoto(foto);
+            if (tutte.some(v => ['chiavi', 'giorni', 'nota+', 'nota~', 'nota-'].includes(v.t))) salvaNote(note);
+            if (tutte.some(v => v.t === 'coach+' || v.t === 'coach-')) aggiornaDopoModificaArchivio();
+            return Array.from(new Set(lasciate));
+        }
+
+        // L'allenamento in corso come lo vedi (routine, esercizi, serie, note), senza
+        // l'orologio dell'inattività: due firme uguali = nessuno l'ha toccato nel frattempo
+        const firmaSessione = s => s ? JSON.stringify({ giorno: s.giorno, inizio: s.inizio, esercizi: s.esercizi }) : null;
+
+        // Voce di diario per una modifica dell'IA all'allenamento in corso: com'era prima e
+        // com'è dopo (null = chiuso). Va scritta DOPO la modifica.
+        function annotaSessione(ctx, prima, salvataggio) {
+            ctx.diario.push({ t: 'sessione', prima, dopo: firmaSessione(sessioneAttiva), ...(salvataggio ? { salvataggio } : {}) });
+        }
+
+        // L'esercizio dell'allenamento in corso: per chiave, come nel JSON, o per solo nome
+        function esercizioInCorso(rif, alias) {
+            if (!sessioneAttiva || !rif) return null;
+            const chiave = segui(alias, String(rif).trim());
+            const lista = sessioneAttiva.esercizi;
+            const perNome = lista.filter(es => normalizzaRif(es.nome) === normalizzaRif(soloNomeEsercizio(chiave)));
+            return lista.find(es => es.key === chiave)
+                || lista.find(es => normalizzaRif(es.key) === normalizzaRif(chiave))
+                || (perNome.length === 1 ? perNome[0] : null);
+        }
+
+        const copiaSessione = () => JSON.parse(JSON.stringify(sessioneAttiva));
+
+        // Nota scritta dall'IA: stessa forma di quelle che salvi a fine allenamento
+        function nuovaNotaIA(chiave, data, giorno, testo, ctx) {
+            const mappa = caricaNote();
+            const inizio = data === oggiPerIA().slice(0, 10) ? Date.now() : new Date(data + 'T12:00:00').getTime();
+            const nota = {
+                id: 'n' + inizio.toString(36) + Math.random().toString(36).slice(2, 7),
+                data, inizio, giorno, testo
+            };
+            (mappa[chiave] = mappa[chiave] || []).push(nota);
+            salvaNote(mappa);
+            ctx.diario.push({ t: 'nota+', id: nota.id });
+            aggiornaNoteGemelle(chiave);
+            return nota;
         }
 
         // ================= ESECUTORE =================
@@ -6508,12 +6771,100 @@
                     if (!trovati.length) return { errore: `punto «${az.punto}» non trovato` };
                     if (trovati.length > 1) return { errore: `«${az.punto}» corrisponde a più punti: serve un testo più preciso` };
                     const accendi = az.attiva !== false;
+                    // Giallo (mia-evidenza) o blu delle novità (ai-nuovo), come i due pulsanti del chip
+                    const blu = az.colore === 'blu';
+                    const classe = blu ? 'ai-nuovo' : 'mia-evidenza';
                     // Stessa logica del pulsante: toglierla da un punto dentro un gruppo
-                    // evidenziato lascia il giallo sul resto del gruppo
-                    if (accendi) accendiEvidenza([trovati[0].li]);
-                    else spegniEvidenza([trovati[0].li]);
+                    // evidenziato lascia il colore sul resto del gruppo
+                    if (accendi) accendiEvidenza([trovati[0].li], classe);
+                    else spegniEvidenza([trovati[0].li], classe);
                     segnaEsercizioToccato(trovati[0].li);
-                    return { testo: `${accendi ? 'Evidenziato' : 'Evidenziazione tolta'} in <strong>${escapeHtml(bersaglio.chiave)}</strong>: ${escapeHtml(testoPunto(trovati[0].li))}` };
+                    const fatto = blu ? (accendi ? 'Segnato in blu' : 'Blu tolto') : (accendi ? 'Evidenziato' : 'Evidenziazione tolta');
+                    return { testo: `${fatto} in <strong>${escapeHtml(bersaglio.chiave)}</strong>: ${escapeHtml(testoPunto(trovati[0].li))}` };
+                }
+
+                // Interlinea e spazio prima/dopo: di un punto (vive nel suo style, dentro la
+                // scheda) o di tutta la scheda (chiave a sé), come il pannello "Spaziatura"
+                case 'spaziatura': {
+                    if (!az.esercizio) {
+                        ctx.diario.push({ t: 'spaziatura', valore: localStorage.getItem(SPAZIATURA_KEY) });
+                        if (az.ripristina) {
+                            localStorage.setItem(SPAZIATURA_KEY, JSON.stringify(SPAZIATURA_INIZIALE));
+                            applicaSpaziaturaScheda();
+                        } else {
+                            const interlinea = valoreSp('interlinea', az.interlinea);
+                            const traPunti = valoreSp('traPunti', az.spazio_tra_punti);
+                            if (interlinea == null && traPunti == null) return { errore: 'nessun valore di spaziatura da impostare' };
+                            if (interlinea != null) impostaSpaziaturaScheda('interlinea', interlinea);
+                            if (traPunti != null) impostaSpaziaturaScheda('traPunti', traPunti);
+                        }
+                        const s = spaziaturaScheda();
+                        return { testo: `Spaziatura di tutta la scheda: interlinea ${numeroIt(s.interlinea)}, ${numeroIt(s.traPunti)} pt tra i punti` };
+                    }
+                    const bersaglio = risolviEsercizio(az.esercizio, alias);
+                    if (!bersaglio) return { errore: `esercizio «${az.esercizio}» non trovato` };
+                    const cercato = normalizzaRif(String(az.punto || '').replace(/<[^>]*>/g, ''));
+                    if (!cercato) return { errore: 'punto mancante: per tutta la scheda ometti "esercizio"' };
+                    const punti = Array.from(bersaglio.ul.closest('details').querySelectorAll('li'))
+                        .filter(li => !li.classList.contains('ai-category-item'))
+                        .map(li => ({ li, testo: normalizzaRif(testoPunto(li)) }))
+                        .filter(p => p.testo);
+                    const esatti = punti.filter(p => p.testo === cercato);
+                    const trovati = esatti.length ? esatti : punti.filter(p => p.testo.includes(cercato));
+                    if (!trovati.length) return { errore: `punto «${az.punto}» non trovato` };
+                    if (trovati.length > 1) return { errore: `«${az.punto}» corrisponde a più punti: serve un testo più preciso` };
+                    const li = trovati[0].li;
+                    const valori = az.ripristina
+                        ? { interlinea: null, prima: null, dopo: null }
+                        : { interlinea: valoreSp('interlinea', az.interlinea), prima: valoreSp('prima', az.spazio_prima), dopo: valoreSp('dopo', az.spazio_dopo) };
+                    const daCambiare = Object.entries(valori).filter(([, v]) => az.ripristina || v != null);
+                    if (!daCambiare.length) return { errore: 'nessun valore di spaziatura da impostare' };
+                    daCambiare.forEach(([campo, v]) => impostaSpPunto(li, campo, v));
+                    segnaEsercizioToccato(li);
+                    const descr = az.ripristina ? 'come il resto della scheda'
+                        : daCambiare.map(([campo, v]) => `${{ interlinea: 'interlinea', prima: 'spazio prima', dopo: 'spazio dopo' }[campo]} ${numeroIt(v)}${campo === 'interlinea' ? '' : ' pt'}`).join(', ');
+                    return { testo: `Spaziatura in <strong>${escapeHtml(bersaglio.chiave)}</strong>: ${escapeHtml(testoPunto(li))} → ${escapeHtml(descr)}` };
+                }
+
+                // --- Note degli allenamenti (Correzioni › Note degli allenamenti) ---
+                // Seguono il movimento come a mano: una nota si trova da qualunque giorno
+                // in cui compare l'esercizio
+                case 'aggiungi_nota_allenamento': {
+                    const bersaglio = risolviEsercizio(az.esercizio, alias);
+                    if (!bersaglio) return { errore: `esercizio «${az.esercizio}» non trovato` };
+                    if (!dataValidaIA(az.data)) return { errore: 'data mancante o non valida' };
+                    const testo = String(az.testo || '').trim();
+                    if (!testo) return { errore: 'testo della nota mancante' };
+                    nuovaNotaIA(bersaglio.chiave, az.data, bersaglio.chiave.split(' > ')[0], testo, ctx);
+                    return { testo: `Nota dell'allenamento su <strong>${escapeHtml(bersaglio.chiave)}</strong>, ${formattaDataIA(az.data)}`, punti: [testo] };
+                }
+
+                case 'modifica_nota_allenamento': {
+                    const bersaglio = risolviEsercizio(az.esercizio, alias);
+                    if (!bersaglio) return { errore: `esercizio «${az.esercizio}» non trovato` };
+                    const testo = String(az.testo || '').trim();
+                    if (!testo) return { errore: 'testo vuoto: per toglierla usa "elimina_nota_allenamento"' };
+                    const mappa = caricaNote();
+                    const trovata = cercaNota(mappa, bersaglio.chiave, az.nota_id);
+                    if (!trovata) return { errore: `nota «${az.nota_id}» non trovata tra quelle di «${bersaglio.chiave}»` };
+                    ctx.diario.push({ t: 'nota~', id: trovata.nota.id, testo: trovata.nota.testo, nuovo: testo });
+                    trovata.nota.testo = testo;
+                    salvaNote(mappa);
+                    aggiornaNoteGemelle(bersaglio.chiave);
+                    return { testo: `Nota dell'allenamento aggiornata su <strong>${escapeHtml(bersaglio.chiave)}</strong> (${escapeHtml(dataNota(trovata.nota))})`, punti: [testo] };
+                }
+
+                case 'elimina_nota_allenamento': {
+                    const bersaglio = risolviEsercizio(az.esercizio, alias);
+                    if (!bersaglio) return { errore: `esercizio «${az.esercizio}» non trovato` };
+                    const mappa = caricaNote();
+                    const trovata = cercaNota(mappa, bersaglio.chiave, az.nota_id);
+                    if (!trovata) return { errore: `nota «${az.nota_id}» non trovata tra quelle di «${bersaglio.chiave}»` };
+                    mappa[trovata.chiave].splice(trovata.indice, 1);
+                    salvaNote(mappa);
+                    ctx.diario.push({ t: 'nota-', chiave: trovata.chiave, nota: trovata.nota });
+                    aggiornaNoteGemelle(bersaglio.chiave);
+                    return { testo: `Nota dell'allenamento eliminata da <strong>${escapeHtml(bersaglio.chiave)}</strong> (${escapeHtml(dataNota(trovata.nota))})` };
                 }
 
                 case 'registra_carichi': {
@@ -6533,14 +6884,25 @@
                     if (!giorno) return { errore: `giorno «${az.giorno}» non trovato` };
                     if (!dataValidaIA(az.data)) return { errore: 'data mancante o non valida' };
 
-                    const svolti = [], ignorati = [];
+                    const svolti = [], ignorati = [], conNota = [];
                     (Array.isArray(az.esercizi_svolti) ? az.esercizi_svolti : []).forEach(e => {
                         const rif = e && e.esercizio;
                         const b = risolviEsercizio(rif, alias) || risolviEsercizio(`${giorno.nome} > ${soloNomeEsercizio(rif)}`, alias);
                         const sets = setDaIA(e && e.serie);
-                        if (!b || !sets.length) ignorati.push(rif || '?');
+                        const nota = String((e && e.nota) || '').trim();
+                        // Come nel pulsante "Note" dell'allenamento dal vivo: la nota si salva anche senza serie
+                        if (b && nota) conNota.push({ chiave: b.chiave, nota });
+                        if (!b || !sets.length) { if (!b || !nota) ignorati.push(rif || '?'); }
                         else svolti.push({ chiave: b.chiave, sets });
                     });
+                    const salvaNoteSvolte = () => conNota.map(({ chiave, nota }) => {
+                        nuovaNotaIA(chiave, az.data, giorno.nome, nota, ctx);
+                        return `Nota su ${soloNomeEsercizio(chiave)}: ${nota}`;
+                    });
+                    if (!svolti.length && conNota.length) {
+                        // Nessuna serie: come "Salva le note" a fine allenamento, l'allenamento non si registra
+                        return { testo: `Note dell'allenamento <strong>${escapeHtml(giorno.nome)}</strong> del ${formattaDataIA(az.data)} salvate (nessuna serie da registrare)`, punti: salvaNoteSvolte() };
+                    }
                     if (!svolti.length) return { errore: 'nessun esercizio riconosciuto con serie da registrare' };
 
                     let volume = 0, serieTot = 0, repsTot = 0;
@@ -6570,7 +6932,7 @@
 
                     return {
                         testo: `Allenamento registrato: <strong>${escapeHtml(giorno.nome)}</strong>, ${formattaDataIA(az.data)}${durata ? ' · ' + formattaTempo(durata) : ''} · ${Math.round(volume)}kg`,
-                        punti: svolti.map(({ chiave, sets }) => `${soloNomeEsercizio(chiave)}: ${descriviSerie(sets)}`),
+                        punti: svolti.map(({ chiave, sets }) => `${soloNomeEsercizio(chiave)}: ${descriviSerie(sets)}`).concat(salvaNoteSvolte()),
                         nota: ignorati.length ? `non riconosciuti e quindi non registrati: ${ignorati.join(', ')}` : ''
                     };
                 }
@@ -6644,13 +7006,142 @@
                     return { testo: `Modello tolto dall'elenco: <strong>${escapeHtml(id)}</strong>`, nota: `modello attivo: ${modelloCorrente}` };
                 }
 
+                case 'imposta_ricerca_web': {
+                    const attiva = az.attiva !== false;
+                    ctx.diario.push({ t: 'ricerca', attiva: ricercaWebAttiva() });
+                    cambiaRicercaWebIA(attiva);
+                    const casella = document.getElementById('ricerca-web-ia');
+                    if (casella) casella.checked = attiva;
+                    return { testo: `Ricerca web dell'assistente: <strong>${attiva ? 'accesa' : 'spenta'}</strong>`, nota: 'vale dalla prossima richiesta' };
+                }
+
+                // --- Allenamento in corso: gli stessi gesti della sua schermata ---
+                case 'avvia_allenamento': {
+                    const giorno = risolviGiorno(az.giorno, aliasGiorni);
+                    if (!giorno) return { errore: `giorno «${az.giorno}» non trovato` };
+                    if (sessioneAttiva) return { errore: `c'è già un allenamento in corso (${sessioneAttiva.giorno}): prima va salvato o scartato` };
+                    const nuova = nuovaSessioneDi(giorno.nome);
+                    if (!nuova) return { errore: `la routine «${giorno.nome}» non ha esercizi` };
+                    sessioneAttiva = nuova;
+                    salvaSessioneAttiva();
+                    annotaSessione(ctx, null);
+                    aggiornaVistaSessione();
+                    return {
+                        testo: `Allenamento avviato: <strong>${escapeHtml(giorno.nome)}</strong>`,
+                        punti: nuova.esercizi.map(es => `${es.nome}: ${descriviSerie(es.serie)}`),
+                        nota: 'lo apri con il pulsante «Riprendi» in basso'
+                    };
+                }
+
+                case 'serie_in_corso': {
+                    if (!sessioneAttiva) return { errore: 'nessun allenamento in corso' };
+                    const es = esercizioInCorso(az.esercizio, alias);
+                    if (!es) return { errore: `«${az.esercizio}» non è nell'allenamento in corso` };
+                    const richieste = Array.isArray(az.serie) ? az.serie : [];
+                    const nuove = normalizzaSerie(richieste);
+                    if (!nuove.length) return { errore: 'nessuna serie: serve l\'elenco completo' };
+                    const prima = copiaSessione();
+                    // Come a mano: una serie si spunta solo con le ripetizioni; quella che
+                    // c'era già nella stessa posizione conserva com'era programmata (anche
+                    // il non saperlo, negli allenamenti avviati prima del "piano"); una serie
+                    // nuova non ha piano, come quelle aggiunte con "+ Serie"
+                    es.serie = nuove.map((s, j) => {
+                        const vecchia = es.serie[j];
+                        const chiesto = richieste[j] && richieste[j].fatto;
+                        const fatto = s.reps !== '' && (chiesto === undefined ? !!(vecchia && vecchia.fatto) : chiesto === true);
+                        if (!vecchia) return { ...s, fatto, piano: null };
+                        return 'piano' in vecchia ? { ...s, fatto, piano: vecchia.piano } : { ...s, fatto };
+                    });
+                    registraAttivita();
+                    annotaSessione(ctx, prima);
+                    aggiornaVistaSessione();
+                    const fatte = es.serie.filter(s => s.fatto).length;
+                    return { testo: `Allenamento in corso, <strong>${escapeHtml(es.nome)}</strong>: ${escapeHtml(descriviSerie(es.serie))} (${fatte}/${es.serie.length} fatte)` };
+                }
+
+                case 'nota_in_corso': {
+                    if (!sessioneAttiva) return { errore: 'nessun allenamento in corso' };
+                    const es = esercizioInCorso(az.esercizio, alias);
+                    if (!es) return { errore: `«${az.esercizio}» non è nell'allenamento in corso` };
+                    const prima = copiaSessione();
+                    es.nota = String(az.testo || '');
+                    registraAttivita();
+                    annotaSessione(ctx, prima);
+                    aggiornaVistaSessione();
+                    return { testo: `Allenamento in corso, nota su <strong>${escapeHtml(es.nome)}</strong>${es.nota.trim() ? '' : ' tolta'}`, punti: es.nota.trim() ? [es.nota.trim()] : [], nota: 'diventa una nota dell\'esercizio quando salvi l\'allenamento' };
+                }
+
+                // Il "Termina" della schermata: salva (come "Salva allenamento") o scarta
+                case 'termina_allenamento': {
+                    if (!sessioneAttiva) return { errore: 'nessun allenamento in corso' };
+                    const prima = copiaSessione();
+                    document.getElementById('riepilogo-modal').classList.remove('visible');
+                    if (az.salva === false) {
+                        sessioneAttiva = null;
+                        salvaSessioneAttiva();
+                        chiudiSessioneUI();
+                        annotaSessione(ctx, prima);
+                        return { testo: `Allenamento scartato: <strong>${escapeHtml(prima.giorno)}</strong>`, nota: 'serie e note di quell\'allenamento non sono state salvate' };
+                    }
+                    if (statisticheSessione().serie === 0 && !eserciziConNota().length) {
+                        return { errore: 'nessuna serie fatta e nessuna nota: non c\'è niente da salvare (si può solo scartare)' };
+                    }
+                    // Le voci del salvataggio stanno dentro quella della sessione: "Annulla" le
+                    // toglie solo se rimette in corso l'allenamento, così non si perde mai
+                    const salvataggio = [];
+                    const esito = salvaSessioneInCorso(salvataggio);
+                    annotaSessione(ctx, prima, salvataggio);
+                    return {
+                        testo: esito.registrato
+                            ? `Allenamento salvato: <strong>${escapeHtml(prima.giorno)}</strong> · ${esito.volume}kg · ${esito.serie} serie`
+                            : `Note dell'allenamento <strong>${escapeHtml(prima.giorno)}</strong> salvate (nessuna serie fatta: l'allenamento non è stato registrato)`,
+                        nota: esito.note ? `${esito.note === 1 ? '1 nota salvata' : esito.note + ' note salvate'} in Correzioni › Note degli allenamenti` : ''
+                    };
+                }
+
+                // --- Archivio dei messaggi del coach (vista Coach) ---
+                // Come incollare dei messaggi: entra solo ciò che manca
+                case 'aggiungi_messaggi_coach': {
+                    const lista = (Array.isArray(az.messaggi_coach) ? az.messaggi_coach : []).map(m => ({
+                        data: m && m.data, ora: normalizzaOra(m && m.ora),
+                        autore: nomeAutore(m && m.autore), testo: String((m && m.testo) || '').trim()
+                    })).filter(m => m.testo);
+                    if (!lista.length) return { errore: 'nessun messaggio con del testo da aggiungere' };
+                    if (lista.some(m => !dataValidaIA(m.data))) return { errore: 'data mancante o non valida in un messaggio' };
+                    if (lista.some(m => !m.autore)) return { errore: 'mittente mancante in un messaggio' };
+                    const esito = uniscMessaggiCoach(lista, 'assistente');
+                    if (!esito) return { errore: 'archivio non salvato: spazio del browser esaurito' };
+                    if (!esito.aggiunti.length) return { errore: 'erano già tutti in archivio' };
+                    ctx.diario.push({ t: 'coach+', idImport: esito.idImport });
+                    aggiornaDopoModificaArchivio();
+                    return {
+                        testo: `Archivio del coach: ${esito.aggiunti.length === 1 ? '1 messaggio aggiunto' : esito.aggiunti.length + ' messaggi aggiunti'}`,
+                        punti: esito.aggiunti.map(m => `${dataIt(m.data)}${m.ora ? ' ' + m.ora : ''} — ${m.autore}: ${m.testo.length > 140 ? m.testo.slice(0, 140) + '…' : m.testo}`),
+                        nota: esito.saltati ? `${esito.saltati} ${esito.saltati === 1 ? 'era già presente' : 'erano già presenti'}` : ''
+                    };
+                }
+
+                case 'elimina_messaggio_coach': {
+                    const archivio = caricaArchivioCoach();
+                    const m = archivio.messaggi.find(x => x.id === az.messaggio_id);
+                    if (!m) return { errore: `messaggio «${az.messaggio_id}» non trovato nell'archivio` };
+                    archivio.messaggi = archivio.messaggi.filter(x => x !== m);
+                    if (!salvaArchivioCoach(archivio)) return { errore: 'archivio non salvato: spazio del browser esaurito' };
+                    ctx.diario.push({ t: 'coach-', messaggio: m });
+                    aggiornaDopoModificaArchivio();
+                    const testo = m.testo || descriviAllegati(m.allegati);
+                    return { testo: `Messaggio eliminato dall'archivio del coach: ${escapeHtml(m.autore)}, ${dataIt(m.data)}`, punti: [testo.length > 160 ? testo.slice(0, 160) + '…' : testo] };
+                }
+
                 default:
                     return { errore: `azione «${az.tipo}» non riconosciuta` };
             }
         }
 
         function applicaGruppoAzioni(azioni, ctx) {
-            const ordinate = azioni.slice().sort((a, b) => ORDINE_AZIONI.indexOf(a.tipo) - ORDINE_AZIONI.indexOf(b.tipo));
+            // Con un "termina" nella stessa risposta, il nuovo allenamento parte per ultimo
+            const posto = az => ctx.avviaDopoTermina && az.tipo === 'avvia_allenamento' ? ORDINE_AZIONI.length : ORDINE_AZIONI.indexOf(az.tipo);
+            const ordinate = azioni.slice().sort((a, b) => posto(a) - posto(b));
             ordinate.forEach(az => {
                 let esito;
                 try {
@@ -6673,13 +7164,13 @@
 
                 card.innerHTML = `
                     <h2>Serve il tuo ok</h2>
-                    <p class="ia-conferma-intro">Il resto è già stato applicato. Queste invece <strong>rinominano, spostano o eliminano</strong> qualcosa: scegli quali confermare.</p>
+                    <p class="ia-conferma-intro">Il resto è già stato applicato. Queste invece <strong>rinominano, spostano, eliminano o chiudono</strong> qualcosa: scegli quali confermare.</p>
                     <ul class="ia-conferma-lista">
                         ${azioni.map((az, i) => {
                             // Per le foto da eliminare si vede quale: il solo nome non basta
                             const foto = az.tipo === 'elimina_foto' ? trovaFotoIA(az.foto_id) : null;
                             return `
-                            <li class="${az.tipo.startsWith('elimina') ? 'pericolosa' : ''}">
+                            <li class="${az.tipo.startsWith('elimina') || (az.tipo === 'termina_allenamento' && az.salva === false) ? 'pericolosa' : ''}">
                                 <label>
                                     <input type="checkbox" data-i="${i}" checked>
                                     <span>
@@ -6742,23 +7233,53 @@
 
         // ================= CHIAMATA AL MODELLO =================
 
-        function promptAzioniIA(contesto, messaggio, conRicerca) {
+        // Le immagini delle foto partono solo se il messaggio parla di foto (scelta
+        // dell'utente: le altre richieste restano leggere). Ognuna è preceduta da una riga
+        // con lo stesso id del JSON. Dalle più recenti: se pesano troppo, le più vecchie restano fuori.
+        const LIMITE_FOTO_IA = 14 * 1024 * 1024; // caratteri di base64: Gemini accetta richieste fino a 20 MB
+        const parlaDiFoto = messaggio => /\b(foto|immagin)/i.test(messaggio);
+
+        function allegatiFotoIA() {
+            const viste = new Set(), tutte = [];
+            Object.keys(ottieniMappaEsercizi()).forEach(chiave => fotoDelMovimento(chiave).forEach(f => {
+                if (viste.has(f.id)) return;
+                viste.add(f.id);
+                tutte.push({ chiave, f });
+            }));
+            tutte.sort((a, b) => String(b.f.ts).localeCompare(String(a.f.ts)));
+            const parti = [], escluse = [];
+            let peso = 0;
+            tutte.forEach(({ chiave, f }) => {
+                const m = /^data:(image\/[\w.+-]+);base64,(.+)$/.exec(f.src || '');
+                if (!m || peso + m[2].length > LIMITE_FOTO_IA) { escluse.push(f.id); return; }
+                peso += m[2].length;
+                parti.push({ text: `Foto ${f.id} di «${chiave}», caricata il ${String(f.ts || '').slice(0, 10)}:` });
+                parti.push({ inline_data: { mime_type: m[1], data: m[2] } });
+            });
+            return { parti, allegate: parti.length / 2, escluse };
+        }
+
+        function promptAzioniIA(contesto, messaggio, conRicerca, foto) {
+            const regolaFoto = foto ? `
+G16. IMMAGINI DELLE FOTO: dopo questo testo ricevi le immagini di ${foto.allegate} foto degli esercizi, ognuna preceduta dalla riga «Foto <id> di <chiave>, caricata il <data>»; l'id è lo stesso del campo "foto" nel JSON. Guardale per rispondere a domande su di esse (regolazioni della macchina, posizione, cosa si vede) e per capire quale foto intende l'atleta quando ne chiede una da eliminare.${foto.escluse.length ? ` Le ${foto.escluse.length} foto più vecchie non sono allegate perché pesano troppo: di quelle hai solo id e data.` : ''}` : '';
             const regolaRicerca = conRicerca ? `
 G13. RICERCA WEB: hai a disposizione la ricerca Google. Usala quando il messaggio chiede informazioni che non sono nei dati dell'app: come si esegue un esercizio che non conosci, varianti o alternative a un esercizio, evidenze scientifiche, il significato di un termine tecnico. Non serve per applicare il feedback del coach né per ordini sulla scheda o sui dati registrati. Preferisci fonti affidabili: studi peer-reviewed (es. PubMed), meta-analisi, position stand (NSCA, ACSM, ISSN), siti universitari o istituzionali; evita blog, forum e siti commerciali.
 G14. CIÒ CHE TROVI ONLINE NON È DEL COACH: non va MAI nell'azione "correzioni", che riporta solo le indicazioni del coach. Può finire nelle correzioni personali, in una nota o in un nuovo esercizio SOLO se l'atleta lo chiede esplicitamente, e in quel caso scrivi nel "riepilogo" quali fonti hai usato. Se il messaggio è solo una domanda, non emettere azioni: rispondi nel "riepilogo", anche con più di tre frasi se serve, citando le fonti.` : '';
-            return `Sei l'assistente di un atleta in sala pesi e hai in mano TUTTI I SUOI DATI dell'app di allenamento: scheda, programmazione, storico carichi, allenamenti salvati, foto e modello IA in uso. Ricevi i dati in JSON e un MESSAGGIO, e rispondi con un ELENCO DI AZIONI da applicare. Puoi fare tutto ciò che l'atleta può fare a mano nell'app.
+            return `Sei l'assistente di un atleta in sala pesi e hai in mano TUTTI I SUOI DATI dell'app di allenamento: scheda, programmazione, storico carichi, allenamento in corso, allenamenti salvati, note degli allenamenti, foto, messaggi recenti del coach, spaziatura della scheda, modello IA e ricerca web. Ricevi i dati in JSON e un MESSAGGIO, e rispondi con un ELENCO DI AZIONI da applicare. Puoi fare tutto ciò che l'atleta può fare a mano nell'app.
 
 Il messaggio può essere di tre nature, capiscilo da solo:
 (a) il feedback di un coach da schematizzare in correzioni (caso più frequente);
-(b) un ordine diretto sulla scheda ("sostituisci la panca con le croci ai cavi", "porta lo squat a 4x6 con 80kg", "sposta i richiami in giorno 3", "il riposo sullo stacco mettilo a 4 minuti", "evidenziami il punto sulle scapole");
-(c) un ordine sui dati registrati ("ieri ho fatto upper: panca 95x7, 95x6...", "cancella la sessione di squat del 3 settembre", "elimina la foto vecchia della chest press", "togli l'allenamento doppio di martedì").
+(b) un ordine diretto sulla scheda ("sostituisci la panca con le croci ai cavi", "porta lo squat a 4x6 con 80kg", "sposta i richiami in giorno 3", "il riposo sullo stacco mettilo a 4 minuti", "evidenziami il punto sulle scapole", "togli il blu dalle correzioni della panca", "metti l'interlinea a 1,5");
+(c) un ordine sui dati registrati ("ieri ho fatto upper: panca 95x7, 95x6...", "cancella la sessione di squat del 3 settembre", "elimina la foto vecchia della chest press", "togli l'allenamento doppio di martedì", "aggiungi una nota allo squat di oggi: ginocchio un po' dolorante", "cosa avevo scritto nelle note della panca?", "salva nell'archivio del coach questo messaggio di Marco: ...");
+(d) un ordine sull'allenamento in corso ("avvia upper", "segna fatte le prime due serie di panca", "l'ultima serie di squat era 100x5", "ho finito, salva l'allenamento").
 Nulla vieta che contenga più cose insieme.
 
 === AZIONI DISPONIBILI (campo "tipo") ===
 Scheda:
 - correzioni           → esercizio, nuovi_li (correzioni del coach)
 - correzioni_personali → esercizio, nuovi_li (note personali dell'atleta: solo su sua richiesta esplicita, vedi regole P)
-- evidenzia            → esercizio, punto, attiva (true = evidenzia, false = togli l'evidenziazione)
+- evidenzia            → esercizio, punto, attiva (true = metti, false = togli), [colore] ("giallo" = evidenziazione dell'atleta, è il valore se lo ometti; "blu" = segno delle novità)
+- spaziatura           → [esercizio, punto], [interlinea], [spazio_prima], [spazio_dopo], [spazio_tra_punti], [ripristina] (vedi regole S)
 - schema_serie         → esercizio, serie (ELENCO COMPLETO che sostituisce il precedente)
 - riposo               → esercizio, riposo_sec
 - nota                 → esercizio, nota (nota tecnica breve mostrata durante l'allenamento)
@@ -6771,14 +7292,25 @@ Scheda:
 - elimina_giorno       → giorno
 - elimina_esercizio    → esercizio
 Dati registrati:
-- registra_allenamento → giorno, data, esercizi_svolti (elenco di {esercizio, serie}), [durata_min]
+- registra_allenamento → giorno, data, esercizi_svolti (elenco di {esercizio, serie, [nota]}), [durata_min]
 - registra_carichi     → esercizio, data, serie
 - elimina_carichi      → esercizio, data
 - elimina_allenamento  → allenamento_id
 - elimina_foto         → esercizio, foto_id
+- aggiungi_nota_allenamento → esercizio, data, testo
+- modifica_nota_allenamento → esercizio, nota_id, testo (testo COMPLETO che sostituisce il precedente)
+- elimina_nota_allenamento  → esercizio, nota_id
+- aggiungi_messaggi_coach   → messaggi_coach (elenco di {data, [ora], autore, testo})
+- elimina_messaggio_coach   → messaggio_id
+Allenamento in corso (vedi regole L):
+- avvia_allenamento    → giorno
+- serie_in_corso       → esercizio, serie (ELENCO COMPLETO, ogni serie con "fatto")
+- nota_in_corso        → esercizio, testo (testo COMPLETO; vuoto = togli la nota)
+- termina_allenamento  → salva (true = salva l'allenamento, false = scartalo)
 Impostazioni:
 - imposta_modello      → modello
 - rimuovi_modello      → modello
+- imposta_ricerca_web  → attiva (true = accesa, false = spenta)
 
 === REGOLE GENERALI ===
 G1. "esercizio" deve essere la CHIAVE ESATTA che trovi nel JSON (campo "chiave", nella forma "Giorno > Esercizio"). "giorno" deve essere il nome esatto del giorno. Non inventare chiavi.
@@ -6788,11 +7320,12 @@ G4. SOSTITUIRE UN ESERCIZIO CON UN ALTRO (movimento diverso) = elimina_esercizio
 G5. "posizione" è 1-based e si riferisce all'ordine dentro il suo contenitore. Se non è importante, omettila: il blocco finisce in fondo.
 G6. In "serie": tipo "L" = serie allenante, "W" = riscaldamento. peso in kg (omettilo o lascialo vuoto per il corpo libero), reps numero di ripetizioni. Devi elencare TUTTE le serie dell'esercizio, non solo quelle che cambiano.
 G7. "riposo_sec" è in secondi (es. 210 = 3min 30s).
-G8. Storico carichi, allenamenti salvati e foto si modificano SOLO se il messaggio lo chiede esplicitamente (vedi regole D). Non registrare e non cancellare mai dati di tua iniziativa, nemmeno se ti sembrano doppi o sbagliati: al massimo segnalalo nel "riepilogo".
+G8. Storico carichi, allenamenti salvati, note degli allenamenti e foto si modificano SOLO se il messaggio lo chiede esplicitamente (vedi regole D e N). Non registrare e non cancellare mai dati di tua iniziativa, nemmeno se ti sembrano doppi o sbagliati: al massimo segnalalo nel "riepilogo".
 G9. Non inventare MAI carichi, ripetizioni, date, durate o misure che il messaggio non contiene. Se manca un dato per eseguire un ordine, non eseguirlo e spiegalo nel "riepilogo". Le date relative ("oggi", "ieri", "martedì scorso") le ricavi dal campo "oggi" del JSON; le date vanno sempre scritte AAAA-MM-GG.
 G10. "riepilogo": 1-3 frasi in italiano, discorsive, su cosa hai fatto e su cosa hai deciso di non fare.
-G11. ESERCIZI RIPETUTI IN PIÙ GIORNI: se un esercizio ha il campo "stesso_movimento_anche_in", è lo STESSO movimento che compare anche in quei giorni. Correzioni (del coach e personali), Dettagli Teorici, evidenziazioni, nota tecnica e foto sono CONDIVISI: emetti UNA SOLA azione su UNA SOLA delle sue chiavi e l'app la propaga da sola alle altre. Non duplicare la stessa azione su più chiavi dello stesso movimento. Restano invece SEPARATI per giorno, e vanno indirizzati sulla chiave specifica: schema_serie, riposo e storico carichi (lo stesso movimento può essere pesante in un giorno e di volume in un altro).
-G12. COSA NON PUOI FARE: aggiungere foto (non hai immagini da caricare), fare backup o importare file, accedere o uscire dal cloud, vedere o cambiare la chiave API, cambiare le preferenze di visualizzazione (tema, sezioni aperte/chiuse), comandare l'allenamento dal vivo in corso. Se il messaggio lo chiede, dillo nel "riepilogo" e indica come farlo a mano.${regolaRicerca}
+G11. ESERCIZI RIPETUTI IN PIÙ GIORNI: se un esercizio ha il campo "stesso_movimento_anche_in", è lo STESSO movimento che compare anche in quei giorni. Correzioni (del coach e personali), Dettagli Teorici, evidenziazioni, spaziatura dei punti, nota tecnica, note degli allenamenti e foto sono CONDIVISI: emetti UNA SOLA azione su UNA SOLA delle sue chiavi e l'app la propaga da sola alle altre. Non duplicare la stessa azione su più chiavi dello stesso movimento. Restano invece SEPARATI per giorno, e vanno indirizzati sulla chiave specifica: schema_serie, riposo e storico carichi (lo stesso movimento può essere pesante in un giorno e di volume in un altro).
+G12. COSA NON PUOI FARE: aggiungere foto (non hai immagini da caricare), fare backup o importare file, accedere o uscire dal cloud, vedere o cambiare la chiave API, cambiare le preferenze di visualizzazione (tema, sezioni aperte/chiuse), far partire o fermare il timer di riposo, cambiare le istruzioni o il nome su Discord della chat «Chiedi al coach», annullare la tua ultima modifica (lo fa l'atleta con «Annulla ultima modifica IA»). Se il messaggio lo chiede, dillo nel "riepilogo" e indica come farlo a mano.
+G15. DOMANDE SUI DATI: se il messaggio chiede solo di leggere qualcosa (note, storico, record, correzioni, spaziatura...), non emettere azioni e rispondi nel "riepilogo" con quello che trovi nel JSON, anche con più di tre frasi se serve.${regolaFoto}${regolaRicerca}
 
 === REGOLE PER I DATI REGISTRATI ===
 D1. "registra_allenamento" = l'atleta racconta un allenamento svolto (tipicamente senza aver usato l'app in palestra). Equivale a un allenamento dal vivo salvato: le serie finiscono nello storico carichi, l'allenamento compare tra gli "allenamenti_salvati" e, se è il più recente per quell'esercizio, le serie fatte diventano la nuova programmazione (come fa l'app dopo ogni allenamento). "giorno" è la giornata della scheda che ha svolto; "esercizi_svolti" contiene solo gli esercizi effettivamente fatti, con TUTTE le loro serie nell'ordine in cui le ha fatte. "durata_min" solo se il messaggio la dice.
@@ -6801,7 +7334,30 @@ D3. Nello storico non si modifica una singola serie: per CORREGGERE una sessione
 D4. "elimina_allenamento" toglie un allenamento dagli "allenamenti_salvati" (usa il suo "id"), ma NON cancella le serie dallo storico carichi: se l'atleta vuole sparire anche quelle, aggiungi "elimina_carichi" per ogni esercizio di quel giorno.
 D5. "elimina_foto": usa l'"id" della foto preso dal JSON. Se l'atleta la indica per data ("la foto di agosto") e più foto corrispondono, non scegliere a caso: spiegalo nel "riepilogo".
 D6. Nelle serie dello storico "W" indica un riscaldamento e "BW" il corpo libero (peso vuoto).
-D7. "imposta_modello" / "rimuovi_modello" solo se l'atleta chiede di cambiare il modello IA; il cambio vale dalla richiesta successiva.
+D7. "imposta_modello" / "rimuovi_modello" solo se l'atleta chiede di cambiare il modello IA; il cambio vale dalla richiesta successiva. Lo stesso per "imposta_ricerca_web" (accende o spegne la ricerca Google dell'assistente).
+
+=== REGOLE PER LE NOTE DEGLI ALLENAMENTI ===
+N1. Sono le note che l'atleta scrive durante l'allenamento (sensazioni, tecnica, cose da ricordare) e si leggono in Correzioni › "Note degli allenamenti". Nel JSON stanno in "note_allenamenti" di ogni esercizio, dalla più recente: id, data, giorno (la routine in cui è stata scritta) e testo. Seguono il movimento come le foto: la stessa nota compare in tutti i giorni dell'esercizio.
+N2. Non sono correzioni: non spostarle mai in "correzioni" o "correzioni_personali", e non scrivere lì dentro ciò che l'atleta ti chiede di annotare come nota di un allenamento.
+N3. "aggiungi_nota_allenamento" = una nota nuova per quella data (se non la dice, è oggi). Se l'atleta racconta un allenamento svolto con anche delle sensazioni sugli esercizi, mettile nel campo "nota" dei suoi "esercizi_svolti" dentro "registra_allenamento", non in azioni separate.
+N4. "modifica_nota_allenamento" sostituisce il testo intero della nota indicata da "nota_id": riporta anche le parti che non cambiano. "elimina_nota_allenamento" toglie la nota: solo se l'atleta lo chiede.
+
+=== REGOLE PER L'ALLENAMENTO IN CORSO ===
+L1. "allenamento_in_corso" c'è solo se l'atleta ha avviato una routine e non l'ha ancora salvata: "giorno", "iniziato", "durata_min", "in_pausa" (fermo da più di 5 minuti senza toccare niente) e, per ogni esercizio, "chiave", "nome", le serie (tipo, peso, reps, "fatto" = spuntata) e l'eventuale "nota". Se il campo manca, non c'è nessun allenamento in corso: per raccontare un allenamento già fatto usa "registra_allenamento".
+L2. "serie_in_corso" riscrive TUTTE le serie di quell'esercizio nell'allenamento in corso, nell'ordine: riporta uguali quelle che non cambiano, con il loro "fatto". Una serie si può segnare fatta solo se ha le ripetizioni. Non serve a cambiare la programmazione: quella si aggiorna da sola quando l'allenamento viene salvato.
+L3. "nota_in_corso" è la nota che l'atleta scrive durante l'allenamento con il pulsante «Note»: diventa una nota dell'allenamento quando lo si salva. Mentre l'allenamento è in corso usa questa, non "aggiungi_nota_allenamento".
+L4. "avvia_allenamento" solo se l'atleta chiede di iniziare una routine e non ce n'è già una in corso. "termina_allenamento" solo se l'atleta dice di aver finito (salva=true) o di voler buttare l'allenamento (salva=false): chiede sempre conferma. Se chiede di chiudere quello in corso e di avviarne un altro, emetti entrambe: l'app chiude prima quello in corso. In quel caso "serie_in_corso" e "nota_in_corso" valgono per l'allenamento che si sta chiudendo.
+
+=== REGOLE PER L'ARCHIVIO DEL COACH ===
+A1. "archivio_coach" è l'archivio dei messaggi Discord tra l'atleta e il coach (vista Coach): "messaggi_totali", "periodo" coperto e "tuo_nome" (il nome dell'atleta su Discord). Ricevi per intero solo i messaggi da "recenti_dal" in poi ("messaggi_recenti": id, data, ora, autore, testo, ruolo = coach / vocale / atleta / bot); dei più vecchi sai solo quanti sono e il periodo. Per domande sui messaggi più vecchi indica la chat «Chiedi al coach», che li legge tutti.
+A2. "aggiungi_messaggi_coach" solo se l'atleta chiede di salvare dei messaggi nell'archivio: copia il testo così com'è, senza riassumere, con data AAAA-MM-GG, ora se c'è e mittente. I messaggi già presenti vengono saltati da soli. Aggiungerli all'archivio NON aggiorna le correzioni in scheda: se l'atleta vuole anche quello, aggiungi le azioni "correzioni" per il loro contenuto.
+A3. "elimina_messaggio_coach" usa l'"id" di un messaggio in "messaggi_recenti", solo su richiesta esplicita.
+
+=== REGOLE PER EVIDENZIAZIONI E SPAZIATURA ===
+E1. "punti_in_blu" elenca i punti segnati in blu adesso (le novità). Il blu si toglie o si mette su un punto con "evidenzia" e colore "blu"; per togliere tutto il blu di un esercizio emetti un "evidenzia" con attiva=false per ogni punto elencato. Non riscrivere le correzioni solo per togliere o mettere colori.
+S1. "spaziatura" SENZA "esercizio" cambia tutta la scheda: "interlinea" (da 0.8 a 3, es. 1.5) e "spazio_tra_punti" (in pt, da 0 a 72); "ripristina": true la riporta ai valori iniziali. I valori attuali sono in "spaziatura_scheda".
+S2. "spaziatura" CON "esercizio" e "punto" (testo del punto come per "evidenzia") cambia solo quel punto: "interlinea", "spazio_prima" e "spazio_dopo" (in pt). "ripristina": true lo fa tornare come il resto della scheda. La spaziatura propria di un punto si vede nel suo attributo style (variabili --sp-interlinea, --sp-prima, --sp-dopo) dentro le correzioni; quando riscrivi le correzioni con "correzioni" o "correzioni_personali", riporta lo style dei punti che sopravvivono.
+S3. Indica solo i valori da cambiare: quelli omessi restano come sono.
 
 === REGOLE PER L'AZIONE "correzioni" (e per "nuovi_li" dentro crea_esercizio) ===
 C0. REGOLA PIÙ IMPORTANTE — INTEGRA, NON SOSTITUIRE: "nuovi_li" deve contenere l'elenco COMPLETO e aggiornato dell'esercizio, cioè le correzioni già presenti in scheda PIÙ quelle nuove, fuse in un unico elenco coerente. Nello specifico:
@@ -6847,7 +7403,7 @@ P3. Struttura semplice: solo <li> (con eventuali sotto-elenchi <ul><li>...</li><
 P4. Per evidenziare un punto delle correzioni personali usa "evidenzia" come per quelle del coach.
 
 === DATI ATTUALI (JSON) ===
-Campi: "oggi" (data odierna); "giorni" (la scheda in ordine: per ogni esercizio "chiave", "nome", "stesso_movimento_anche_in", "correzioni_attuali" (del coach) con i Dettagli Teorici, "correzioni_personali" (note dell'atleta, se ce ne sono), "programmazione" con serie, riposo e nota, "storico_carichi" con TUTTE le sessioni registrate, una per riga, e il record, "foto" con id e data di caricamento); "allenamenti_salvati" (tutti gli allenamenti conclusi, con id, data, giornata, durata, volume); "modello_ia" (modello attivo ed elenco).
+Campi: "oggi" (data odierna); "giorni" (la scheda in ordine: per ogni esercizio "chiave", "nome", "stesso_movimento_anche_in", "correzioni_attuali" (del coach) con i Dettagli Teorici, "correzioni_personali" (note dell'atleta, se ce ne sono), "punti_in_blu" (punti segnati in blu), "note_allenamenti" (note scritte durante gli allenamenti), "programmazione" con serie, riposo e nota, "storico_carichi" con TUTTE le sessioni registrate, una per riga, e il record, "foto" con id e data di caricamento); "allenamento_in_corso" (solo se ce n'è uno, vedi regole L); "allenamenti_salvati" (tutti gli allenamenti conclusi, con id, data, giornata, "durata_min", "volume_kg"); "archivio_coach" (messaggi recenti del coach, vedi regole A); "spaziatura_scheda" ("interlinea" e "spazio_tra_punti_pt" di tutta la scheda); "modello_ia" ("attuale" = modello attivo, "disponibili" = elenco, "ricerca_web" = ricerca web accesa o spenta).
 ${JSON.stringify(contesto, null, 1)}
 
 === MESSAGGIO ===
@@ -6861,7 +7417,8 @@ ${JSON.stringify(contesto, null, 1)}
                 properties: {
                     tipo: { type: "STRING", enum: ["L", "W"] },
                     peso: { type: "NUMBER" },
-                    reps: { type: "NUMBER" }
+                    reps: { type: "NUMBER" },
+                    fatto: { type: "BOOLEAN" } // solo per "serie_in_corso"
                 },
                 required: ["tipo"]
             }
@@ -6888,18 +7445,36 @@ ${JSON.stringify(contesto, null, 1)}
                             nota: { type: "STRING" },
                             punto: { type: "STRING" },
                             attiva: { type: "BOOLEAN" },
+                            colore: { type: "STRING", enum: ["giallo", "blu"] },
+                            interlinea: { type: "NUMBER" },
+                            spazio_prima: { type: "NUMBER" },
+                            spazio_dopo: { type: "NUMBER" },
+                            spazio_tra_punti: { type: "NUMBER" },
+                            ripristina: { type: "BOOLEAN" },
                             data: { type: "STRING" },
                             durata_min: { type: "NUMBER" },
                             esercizi_svolti: {
                                 type: "ARRAY",
                                 items: {
                                     type: "OBJECT",
-                                    properties: { esercizio: { type: "STRING" }, serie: SCHEMA_SERIE_IA },
+                                    properties: { esercizio: { type: "STRING" }, serie: SCHEMA_SERIE_IA, nota: { type: "STRING" } },
                                     required: ["esercizio", "serie"]
                                 }
                             },
                             allenamento_id: { type: "STRING" },
                             foto_id: { type: "STRING" },
+                            nota_id: { type: "STRING" },
+                            testo: { type: "STRING" },
+                            salva: { type: "BOOLEAN" },
+                            messaggio_id: { type: "STRING" },
+                            messaggi_coach: {
+                                type: "ARRAY",
+                                items: {
+                                    type: "OBJECT",
+                                    properties: { data: { type: "STRING" }, ora: { type: "STRING" }, autore: { type: "STRING" }, testo: { type: "STRING" } },
+                                    required: ["data", "autore", "testo"]
+                                }
+                            },
                             modello: { type: "STRING" }
                         },
                         required: ["tipo", "motivo"]
@@ -6955,10 +7530,11 @@ ${JSON.stringify(contesto, null, 1)}
                 .map(p => p.text).join('');
         }
 
-        async function chiamaGemini(apiKey, prompt, schema, btn, etichetta) {
+        // "allegati": altre parti dopo il testo (le immagini delle foto)
+        async function chiamaGemini(apiKey, prompt, schema, btn, etichetta, allegati = []) {
             const inCorso = etichetta || 'Elaborazione in corso...';
             const data = await richiestaGemini(apiKey, {
-                contents: [{ parts: [{ text: prompt }] }],
+                contents: [{ parts: [{ text: prompt }, ...allegati] }],
                 generationConfig: { responseMimeType: "application/json", responseSchema: schema }
             }, (secondi, tentativo) => {
                 btn.innerHTML = secondi
@@ -7014,7 +7590,7 @@ ${JSON.stringify(contesto, null, 1)}
         // recenti accettano insieme ricerca e risposta JSON vincolata allo schema; con quelli
         // che non lo supportano si ripiega su un JSON scritto nel testo e poi estratto.
         // Restituisce la risposta, le fonti consultate e i suggerimenti di ricerca di Google.
-        async function chiamaGeminiConRicerca(apiKey, prompt, schema, btn, etichetta) {
+        async function chiamaGeminiConRicerca(apiKey, prompt, schema, btn, etichetta, allegati = []) {
             const inCorso = etichetta || 'Elaborazione in corso...';
             const suAttesa = (secondi, tentativo) => {
                 btn.innerHTML = secondi
@@ -7025,7 +7601,7 @@ ${JSON.stringify(contesto, null, 1)}
             let data;
             try {
                 data = await richiestaGemini(apiKey, {
-                    contents: [{ parts: [{ text: prompt }] }],
+                    contents: [{ parts: [{ text: prompt }, ...allegati] }],
                     tools: ricerca,
                     generationConfig: { responseMimeType: 'application/json', responseSchema: schema }
                 }, suAttesa);
@@ -7037,7 +7613,7 @@ ${JSON.stringify(contesto, null, 1)}
 
 === FORMATO DELLA RISPOSTA ===
 Rispondi SOLO con un oggetto JSON valido: niente testo prima o dopo, niente blocchi \`\`\`. Dentro le stringhe scrivi le virgolette come \\" (per esempio class=\\"ai-nuovo\\"). Struttura (schema in formato OpenAPI):
-${JSON.stringify(schema)}` }] }],
+${JSON.stringify(schema)}` }, ...allegati] }],
                         tools: ricerca
                     }, suAttesa);
                 } catch (e2) {
@@ -7073,13 +7649,16 @@ ${JSON.stringify(schema)}` }] }],
             try {
                 const contesto = costruisciContestoIA();
                 const conRicerca = ricercaWebAttiva();
+                const foto = parlaDiFoto(messaggio) ? allegatiFotoIA() : null;
+                const allegati = foto && foto.allegate ? foto.parti : [];
+                const prompt = promptAzioniIA(contesto, messaggio, conRicerca, foto && foto.allegate ? foto : null);
                 let risposta, web = null;
                 if (conRicerca) {
-                    const esito = await chiamaGeminiConRicerca(apiKey, promptAzioniIA(contesto, messaggio, true), SCHEMA_RISPOSTA_IA, btn);
+                    const esito = await chiamaGeminiConRicerca(apiKey, prompt, SCHEMA_RISPOSTA_IA, btn, undefined, allegati);
                     risposta = esito.risposta;
                     web = { fonti: esito.fonti, suggerimenti: esito.suggerimenti };
                 } else {
-                    risposta = await chiamaGemini(apiKey, promptAzioniIA(contesto, messaggio, false), SCHEMA_RISPOSTA_IA, btn);
+                    risposta = await chiamaGemini(apiKey, prompt, SCHEMA_RISPOSTA_IA, btn, undefined, allegati);
                 }
 
                 const azioni = (risposta.azioni || []).filter(az => az && AZIONI_VALIDE.includes(az.tipo));
@@ -7098,13 +7677,18 @@ ${JSON.stringify(schema)}` }] }],
 
                 const ctx = { alias: {}, aliasGiorni: {}, fatto: [], saltato: [], evidenziazioniPerse: 0, primoNuovo: null, diario: [] };
 
+                // "Ho finito, salva e avvia lower": avviare il nuovo allenamento aspetta che
+                // quello in corso sia chiuso, quindi passa anche lui dalla conferma, dopo
+                ctx.avviaDopoTermina = azioni.some(az => az.tipo === 'termina_allenamento');
+                const conConferma = az => AZIONI_DA_CONFERMARE.has(az.tipo) || (ctx.avviaDopoTermina && az.tipo === 'avvia_allenamento');
+
                 // 1) Subito ciò che aggiunge o aggiorna
-                const dirette = azioni.filter(az => !AZIONI_DA_CONFERMARE.has(az.tipo));
+                const dirette = azioni.filter(az => !conConferma(az));
                 applicaGruppoAzioni(dirette, ctx);
                 if (dirette.length) consolidaSchedaDopoIA();
 
-                // 2) Con conferma ciò che rinomina, sposta o elimina
-                const daConfermare = azioni.filter(az => AZIONI_DA_CONFERMARE.has(az.tipo));
+                // 2) Con conferma ciò che rinomina, sposta, elimina o chiude
+                const daConfermare = azioni.filter(conConferma);
                 if (daConfermare.length) {
                     const scelte = await chiediConfermaAzioni(daConfermare);
                     daConfermare.filter(az => !scelte.includes(az))
@@ -7206,7 +7790,7 @@ ${JSON.stringify(schema)}` }] }],
         function annullaUltimaIA() {
             const raw = localStorage.getItem(SNAPSHOT_IA_KEY);
             if (!raw) return;
-            if (!confirm("Ripristinare com'era prima dell'ultima elaborazione IA?\nScheda e schema serie tornano allo stato di allora. Da storico carichi, allenamenti salvati e foto viene tolto o rimesso solo ciò che ha cambiato l'IA: quello che hai registrato tu resta.")) return;
+            if (!confirm("Ripristinare com'era prima dell'ultima elaborazione IA?\nScheda e schema serie tornano allo stato di allora. Da storico carichi, allenamenti salvati, note degli allenamenti, foto e archivio del coach viene tolto o rimesso solo ciò che ha cambiato l'IA: quello che hai registrato tu resta. L'allenamento in corso torna com'era solo se dopo l'IA non l'hai toccato.")) return;
             try {
                 const snap = JSON.parse(raw);
 
@@ -7219,7 +7803,7 @@ ${JSON.stringify(schema)}` }] }],
                 if (snap.schemi != null) localStorage.setItem(SCHEMA_STORAGE_KEY, snap.schemi);
                 // Fotografie delle versioni precedenti: contenevano lo storico intero
                 if (snap.logs != null) localStorage.setItem(LOG_STORAGE_KEY, snap.logs);
-                if (Array.isArray(snap.diario)) annullaDiario(snap.diario);
+                const lasciate = Array.isArray(snap.diario) ? annullaDiario(snap.diario) : [];
                 if (snap.stati) {
                     STATI_SEZIONI.forEach(k => {
                         if (snap.stati[k] != null) localStorage.setItem(k, snap.stati[k]);
@@ -7240,7 +7824,7 @@ ${JSON.stringify(schema)}` }] }],
                 consolidaSchedaDopoIA();
                 aggiornaBottoneUndoIA();
                 summaryBox.style.display = 'none';
-                mostraToast('Modifiche IA annullate');
+                mostraToast('Modifiche IA annullate' + (lasciate.length ? ': ' + lasciate.join('; ') : ''));
             } catch (e) {
                 alert('Ripristino non riuscito: ' + e.message);
             }
